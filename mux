@@ -1,0 +1,815 @@
+#!/usr/bin/env bash
+#
+# mux — one launcher for AI coding CLIs and the providers behind them.
+#
+#   mux                              status: which agents/providers/commands you have
+#   mux codex -p stepfun             run codex against StepFun's Step Plan API
+#   mux claude -p glm                run Claude Code against z.ai GLM
+#   mux gen stepfun                  write ~/.local/bin/stepfun for that combination
+#
+# Config lives in ${LAUNCHER_HOME:-~/.config/mux}:
+#   config.json    shareable; providers, agents, generated commands
+#   secrets.json   mode 600; API keys only
+#
+# Requires bash 3.2+ and jq. Launching codex additionally needs codex-cli >= 0.155
+# (for `--profile`). No key is ever echoed.
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+LAUNCHER_HOME="${LAUNCHER_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/mux}"
+CONFIG_FILE="${MUX_CONFIG:-$LAUNCHER_HOME/config.json}"
+SECRETS_FILE="${MUX_SECRETS:-$LAUNCHER_HOME/secrets.json}"
+BIN_DIR="${MUX_BIN_DIR:-$HOME/.local/bin}"
+CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
+
+DRY_RUN=0
+LAUNCH_PROVIDER=""
+LAUNCH_MODEL_AGENT=""
+BASE_INSTRUCTIONS='You are Codex, a helpful coding agent. Read code carefully before changing it and keep responses concise.'
+
+# Agents probed by `mux status`. Config entries and provider defaults are added on top.
+KNOWN_AGENTS=(codex claude gemini agy cursor-agent qwen iflow opencode crush amp droid)
+
+die() { printf 'mux: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*" >&2; }
+
+# --- small helpers ------------------------------------------------------------
+
+self_path() {
+  local p="$0" r d
+  case "$p" in
+    */*) ;;
+    *) p="$(command -v -- "$p" 2>/dev/null || printf '%s' "$p")" ;;
+  esac
+  r="$(readlink -f "$p" 2>/dev/null || true)"
+  [ -n "$r" ] && p="$r"
+  case "$p" in
+    /*) ;;
+    *)  d="$(cd -- "$(dirname -- "$p")" 2>/dev/null && pwd)" && p="$d/$(basename -- "$p")" ;;
+  esac
+  printf '%s\n' "$p"
+}
+SELF_PATH="$(self_path)"
+
+# stdin -> destination, atomically (temp file in the same directory, then rename).
+atomic_write() {
+  local dest="$1" mode="$2" dir tmp
+  dir="$(dirname -- "$dest")"
+  mkdir -p "$dir" || die "cannot create $dir"
+  tmp="$(mktemp "$dir/.mux.XXXXXX")" || die "cannot write into $dir"
+  cat >"$tmp"
+  chmod "$mode" "$tmp"
+  mv -f "$tmp" "$dest" || die "cannot replace $dest"
+}
+
+# cfg <jq-filter> [jq args...] -> raw output; empty when config is absent or broken.
+cfg() {
+  [ -f "$CONFIG_FILE" ] || return 0
+  jq -r "$@" "$CONFIG_FILE" 2>/dev/null || true
+}
+
+secrets_get() {
+  [ -f "$SECRETS_FILE" ] || return 0
+  jq -r --arg p "$1" '.[$p] // empty' "$SECRETS_FILE" 2>/dev/null || true
+}
+
+ensure_config() {
+  if [ ! -f "$CONFIG_FILE" ]; then
+    default_config | atomic_write "$CONFIG_FILE" 600
+    note "created $CONFIG_FILE"
+  fi
+  if [ ! -f "$SECRETS_FILE" ]; then
+    printf '{}\n' | atomic_write "$SECRETS_FILE" 600
+    note "created $SECRETS_FILE (API keys)"
+  fi
+  chmod 600 "$SECRETS_FILE" 2>/dev/null || true
+}
+
+require_jq() {
+  command -v jq >/dev/null 2>&1 || die "jq is required but not installed"
+}
+
+require_codex_profile_support() {
+  command -v codex >/dev/null 2>&1 || die "codex is not on PATH"
+  case "$(codex --help 2>&1 || true)" in
+    *--profile*) return 0 ;;
+    *) die "this codex has no --profile option (needs codex-cli 0.155.1 or newer)" ;;
+  esac
+}
+
+# --- default configuration ----------------------------------------------------
+
+default_config() {
+  cat <<'JSON'
+{
+  "version": 1,
+  "agents": {},
+  "providers": {
+    "stepfun": {
+      "label": "StepFun Step Plan",
+      "status": "verified",
+      "default_agent": "codex",
+      "key_env": ["STEPFUN_API_KEY"],
+      "codex": {
+        "base_url": "https://api.stepfun.com/step_plan/v1",
+        "wire_api": "responses",
+        "model": "step-5-preview",
+        "model_reasoning_effort": "high",
+        "model_catalog": {
+          "slug": "step-5-preview",
+          "display_name": "Step 5 Preview",
+          "description": "StepFun Step Plan flagship, 1M context",
+          "visibility": "list",
+          "supported_in_api": true,
+          "priority": 0,
+          "shell_type": "shell_command",
+          "additional_speed_tiers": [],
+          "base_instructions": "You are Codex, a helpful coding agent. Read code carefully before changing it and keep responses concise.",
+          "apply_patch_tool_type": "freeform",
+          "web_search_tool_type": "text",
+          "truncation_policy": {"mode": "tokens", "limit": 10000},
+          "supports_parallel_tool_calls": true,
+          "supports_image_detail_original": true,
+          "context_window": 1048576,
+          "max_context_window": 1048576,
+          "effective_context_window_percent": 95,
+          "experimental_supported_tools": [],
+          "input_modalities": ["text", "image"],
+          "supports_search_tool": false,
+          "supported_reasoning_levels": [
+            {"effort": "low", "description": "Light reasoning, fast response"},
+            {"effort": "medium", "description": "Standard reasoning depth"},
+            {"effort": "high", "description": "Deep reasoning for complex code and logic"},
+            {"effort": "max", "description": "Maximum reasoning depth"}
+          ],
+          "supports_reasoning_summaries": true,
+          "default_reasoning_summary": "none",
+          "default_reasoning_level": "high",
+          "support_verbosity": true,
+          "default_verbosity": "low",
+          "availability_nux": {"message": ""},
+          "upgrade": null,
+          "model_messages": {
+            "instructions_template": "You are Codex, a helpful coding agent. Read code carefully before changing it and keep responses concise.",
+            "instructions_variables": {}
+          }
+        }
+      }
+    },
+    "glm": {
+      "label": "Z.ai GLM coding plan",
+      "status": "template",
+      "default_agent": "claude",
+      "key_env": ["ZAI_API_KEY", "GLM_API_KEY"],
+      "base_url": "https://api.z.ai/api/anthropic",
+      "model": "glm-4.6",
+      "codex": {
+        "base_url": "https://api.z.ai/api/paas/v4",
+        "wire_api": "chat",
+        "model": "glm-4.6"
+      }
+    },
+    "qwen": {
+      "label": "Qwen (DashScope)",
+      "status": "template",
+      "default_agent": "codex",
+      "key_env": ["QWEN_API_KEY", "DASHSCOPE_API_KEY"],
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "model": "qwen3-coder-plus",
+      "codex": {
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "wire_api": "chat",
+        "model": "qwen3-coder-plus"
+      }
+    }
+  },
+  "commands": {
+    "stepfun": {"agent": "codex", "provider": "stepfun"}
+  }
+}
+JSON
+}
+
+# --- agents -------------------------------------------------------------------
+
+# Path of an agent CLI: explicit `agents.<name>.bin`, else PATH lookup.
+agent_bin() {
+  local a="$1" b
+  b="$(cfg --arg a "$a" '.agents[$a].bin // empty')"
+  if [ -n "$b" ]; then printf '%s\n' "$b"; return 0; fi
+  command -v -- "$a" 2>/dev/null || true
+}
+
+agent_version() {
+  local bin="$1" out=""
+  [ -n "$bin" ] && [ -x "$bin" ] || return 0
+  # Some CLIs (codex) print setup warnings alongside --version; keep only the
+  # first line that actually looks like a version.
+  if command -v timeout >/dev/null 2>&1; then
+    out="$(timeout 5 "$bin" --version </dev/null 2>&1 | grep -v -i -E 'warning|error|not found' | head -n 1)" || out=""
+  else
+    out="$("$bin" --version </dev/null 2>&1 | grep -v -i -E 'warning|error|not found' | head -n 1)" || out=""
+  fi
+  printf '%s' "$(printf '%s' "$out" | tr -d '\r' | cut -c1-40)"
+}
+
+all_agent_names() {
+  {
+    printf '%s\n' "${KNOWN_AGENTS[@]}"
+    cfg '.agents // {} | keys[]'
+    cfg '.providers // {} | to_entries[] | .value.default_agent // empty'
+  } | awk 'NF && !seen[$0]++'
+}
+
+# --- keys ---------------------------------------------------------------------
+
+# Ask for a key on a TTY without echoing it; returns it on stdout.
+prompt_key() {
+  local provider="$1" key="" src=/dev/tty
+  # /dev/tty is right for an interactive run; fall back to stdin when there is no
+  # controlling terminal (pipes, CI) so the prompt never blocks on a dead device.
+  { : >"$src"; } 2>/dev/null || src=/dev/stdin
+  printf 'API key for %s (hidden): ' "$provider" >&2
+  IFS= read -r -s key <"$src" 2>/dev/null || key=""
+  printf '\n' >&2
+  printf '%s' "$key"
+}
+
+save_key() {
+  local provider="$1" key="$2"
+  if [ -f "$SECRETS_FILE" ] && jq -e . "$SECRETS_FILE" >/dev/null 2>&1; then
+    jq --arg p "$provider" --arg k "$key" '.[$p] = $k' "$SECRETS_FILE" | atomic_write "$SECRETS_FILE" 600
+  else
+    jq -n --arg p "$provider" --arg k "$key" '{($p): $k}' | atomic_write "$SECRETS_FILE" 600
+  fi
+}
+
+# Resolution order: provider key_env variables, then secrets.json, then prompt.
+# Prompts once and saves, so later runs never ask again.
+resolve_key() {
+  local provider="$1" key="" var
+  while IFS= read -r var; do
+    case "$var" in
+      [A-Za-z_]*) ;;
+      *) continue ;;
+    esac
+    if [ -n "${!var:-}" ]; then printf '%s' "${!var}"; return 0; fi
+  done < <(cfg --arg p "$provider" '.providers[$p].key_env // [] | .[]')
+
+  key="$(secrets_get "$provider")"
+  if [ -z "$key" ]; then
+    key="$(prompt_key "$provider")"
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    [ -n "$key" ] || die "no API key entered for provider '$provider'"
+    save_key "$provider" "$key"
+    note "saved key for '$provider' in $SECRETS_FILE"
+  fi
+  printf '%s' "$key"
+}
+
+# Never ask, just report: "env VAR" | "stored" | "missing"
+key_state() {
+  local provider="$1" var
+  while IFS= read -r var; do
+    case "$var" in
+      [A-Za-z_]*) ;;
+      *) continue ;;
+    esac
+    if [ -n "${!var:-}" ]; then printf 'env %s' "$var"; return 0; fi
+  done < <(cfg --arg p "$provider" '.providers[$p].key_env // [] | .[]')
+  if [ -n "$(secrets_get "$provider")" ]; then printf 'stored'; return 0; fi
+  printf 'missing'
+}
+
+validate_key() {
+  case "$1" in
+    "") die "empty API key" ;;
+    *'"'*|*$'\n'*) die "API key contains a quote or newline; mux cannot store it" ;;
+  esac
+}
+
+# --- provider helpers ---------------------------------------------------------
+
+provider_exists() { [ -n "$(cfg --arg p "$1" '.providers[$p] // empty')" ]; }
+
+provider_field() {  # provider_field <provider> <jq path relative to the provider>
+  cfg --arg p "$1" ".providers[\$p].$2 // empty"
+}
+
+provider_model() {
+  local m
+  m="$(provider_field "$1" 'codex.model')"
+  [ -n "$m" ] || m="$(provider_field "$1" 'model')"
+  printf '%s' "$m"
+}
+
+# KEY=VALUE lines for an agent, with {key} substituted. Provider `env` wins;
+# agent conventions fill in anything it leaves unset.
+provider_env() {
+  local provider="$1" agent="$2" key="$3"
+  {
+    cfg --arg p "$provider" --arg k "$key" \
+      '.providers[$p].env // {} | to_entries[] | "\(.key)=\(.value | gsub("\\{key\\}"; $k))"'
+    case "$agent" in
+      claude)
+        [ -n "$key" ] && printf 'ANTHROPIC_AUTH_TOKEN=%s\n' "$key"
+        local u m
+        u="$(provider_field "$provider" 'base_url')"
+        [ -n "$u" ] && printf 'ANTHROPIC_BASE_URL=%s\n' "$u"
+        m="$(provider_model "$provider")"
+        [ -n "$m" ] && printf 'ANTHROPIC_MODEL=%s\n' "$m"
+        ;;
+      gemini)
+        [ -n "$key" ] && printf 'GEMINI_API_KEY=%s\n' "$key"
+        ;;
+    esac
+  } | awk -F= 'NF && !seen[$1]++'
+}
+
+# --- codex backend ------------------------------------------------------------
+
+# One model entry: the provider's verified `codex.model_catalog` when it has one,
+# otherwise the same known-good template with this provider's slug.
+catalog_entry() {
+  local provider="$1" model="$2" custom
+  custom="$(cfg --arg p "$provider" '.providers[$p].codex.model_catalog // empty')"
+  if [ -n "$custom" ] && [ "$custom" != "null" ]; then
+    printf '%s' "$custom"
+    return 0
+  fi
+  jq -n --arg slug "$model" --arg instr "$BASE_INSTRUCTIONS" '
+    {
+      slug: $slug,
+      display_name: $slug,
+      description: "Model served through mux",
+      visibility: "list",
+      supported_in_api: true,
+      priority: 0,
+      shell_type: "shell_command",
+      additional_speed_tiers: [],
+      base_instructions: $instr,
+      apply_patch_tool_type: "freeform",
+      web_search_tool_type: "text",
+      truncation_policy: {mode: "tokens", limit: 10000},
+      supports_parallel_tool_calls: true,
+      supports_image_detail_original: true,
+      context_window: 200000,
+      max_context_window: 200000,
+      effective_context_window_percent: 95,
+      experimental_supported_tools: [],
+      input_modalities: ["text", "image"],
+      supports_search_tool: false,
+      supported_reasoning_levels: [
+        {effort: "low", description: "Light reasoning, fast response"},
+        {effort: "medium", description: "Standard reasoning depth"},
+        {effort: "high", description: "Deep reasoning for complex code and logic"},
+        {effort: "max", description: "Maximum reasoning depth"}
+      ],
+      supports_reasoning_summaries: true,
+      default_reasoning_summary: "none",
+      default_reasoning_level: "high",
+      support_verbosity: true,
+      default_verbosity: "low",
+      availability_nux: {message: ""},
+      upgrade: null,
+      model_messages: {instructions_template: $instr, instructions_variables: {}}
+    }'
+}
+
+write_codex_models_json() {
+  local provider="$1" model="$2"
+  local dest="$CODEX_DIR/$provider.models.json"
+  mkdir -p "$CODEX_DIR" || die "cannot create $CODEX_DIR"
+  if [ -f "$dest" ] && jq -e --arg s "$model" '.models | index($s) != null' "$dest" >/dev/null 2>&1; then
+    return 0   # catalog already lists this model; keep any entries the user added
+  fi
+  local entry existing
+  entry="$(catalog_entry "$provider" "$model")"
+  if [ -f "$dest" ] && jq -e '.models' "$dest" >/dev/null 2>&1; then
+    existing="$(jq -c '.models' "$dest")"
+    jq -n --argjson existing "$existing" --argjson entry "$entry" '{models: ($existing + [$entry])}' \
+      | atomic_write "$dest" 644
+  else
+    jq -n --argjson entry "$entry" '{models: [$entry]}' | atomic_write "$dest" 644
+  fi
+  note "wrote $dest"
+}
+
+# The launcher rewrites the profile only when the key or model changed, so
+# hand-edits survive. approval_policy and sandbox_mode are deliberately absent:
+# `--profile` layers on the base config, so the user's own settings still govern them.
+write_codex_profile() {
+  local provider="$1" model="$2" key="$3" effort="$4"
+  local dest="$CODEX_DIR/$provider.config.toml"
+  local cur_key="" cur_model=""
+  if [ -f "$dest" ]; then
+    cur_key="$(sed -n 's/^[[:space:]]*experimental_bearer_token[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$dest" | head -n 1)"
+    cur_model="$(sed -n 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$dest" | head -n 1)"
+  fi
+  if [ -f "$dest" ] && [ "$cur_key" = "$key" ] && [ "$cur_model" = "$model" ] \
+     && grep -q "model_catalog_json = \"$CODEX_DIR/$provider.models.json\"" "$dest"; then
+    chmod 600 "$dest" 2>/dev/null || true
+    return 0
+  fi
+  {
+    cat <<TOML
+# Generated by mux. Layered on the base config by \`codex --profile $provider\`.
+approvals_reviewer = "auto_review"
+model = "$model"
+model_provider = "$provider"
+model_reasoning_effort = "$effort"
+model_catalog_json = "$CODEX_DIR/$provider.models.json"
+service_tier = "default"
+
+[model_providers.$provider]
+name = "$(provider_field "$provider" 'label')"
+base_url = "$(provider_field "$provider" 'codex.base_url')"
+wire_api = "$(provider_field "$provider" 'codex.wire_api')"
+requires_openai_auth = false
+supports_websockets = false
+experimental_bearer_token = "$key"
+TOML
+  } | atomic_write "$dest" 600
+  note "wrote $dest"
+}
+
+launch_codex() {
+  local provider="$1" model="$2"; shift 2
+  local key base wire effort
+  key="$(resolve_key "$provider")"
+  validate_key "$key"
+  base="$(provider_field "$provider" 'codex.base_url')"
+  [ -n "$base" ] || die "provider '$provider' has no codex.base_url in $CONFIG_FILE"
+  wire="$(provider_field "$provider" 'codex.wire_api')"
+  [ -n "$wire" ] || wire="responses"
+  effort="$(provider_field "$provider" 'codex.model_reasoning_effort')"
+  [ -n "$effort" ] || effort="high"
+  write_codex_models_json "$provider" "$model"
+  write_codex_profile "$provider" "$model" "$key" "$effort"
+  require_codex_profile_support
+  exec codex --profile "$provider" "$@"
+}
+
+# --- generic launch (claude, gemini, agy, anything) ---------------------------
+
+launch_generic() {
+  local agent="$1" provider="$2"; shift 2
+  local bin key="" line
+  bin="$(agent_bin "$agent")"
+  [ -n "$bin" ] || die "agent '$agent' is not installed (looked for \`$agent\` on PATH and agents.$agent.bin)"
+  if [ -n "$provider" ]; then
+    key="$(resolve_key "$provider")"
+    validate_key "$key"
+  fi
+  local -a envs=()
+  if [ -n "$provider" ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] && envs+=("$line")
+    done < <(provider_env "$provider" "$agent" "$key")
+  fi
+  if [ "${#envs[@]}" -gt 0 ]; then
+    exec env "${envs[@]}" "$bin" "$@"
+  fi
+  exec "$bin" "$@"
+}
+
+# Print what a launch would do, without running it.
+dry_run_report() {
+  local agent="$1" provider="$2" model="$3"; shift 3
+  local bin key_state key_note="" line
+  printf 'would run:\n'
+  case "$agent" in
+    codex)
+      printf '  codex --profile %s %s\n' "$provider" "$*"
+      printf '  files: %s, %s\n' "$CODEX_DIR/$provider.models.json" "$CODEX_DIR/$provider.config.toml"
+      ;;
+    *)
+      bin="$(agent_bin "$agent")"
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "$line" in
+          *=*) printf '  %s=%s\n' "${line%%=*}" '<hidden>' ;;
+        esac
+      done < <(provider_env "$provider" "$agent" "KEYPLACEHOLDER")
+      printf '  %s %s\n' "${bin:-<not installed>}" "$*"
+      ;;
+  esac
+  case "$(key_state "$provider")" in
+    missing) key_note=" (would prompt and save to $SECRETS_FILE)" ;;
+  esac
+  printf '  provider %s, model %s, key: %s%s\n' "$provider" "$model" "$(key_state "$provider")" "$key_note"
+}
+
+launch() {
+  local agent="$1" provider="$2" model="$3"; shift 3
+  [ -n "$provider" ] || die "no provider given (use: mux $agent -p <provider>)"
+  provider_exists "$provider" || die "unknown provider '$provider' (see: mux providers)"
+  [ -n "$model" ] || model="$(provider_model "$provider")"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    dry_run_report "$agent" "$provider" "$model" "$@"
+    return 0
+  fi
+  case "$agent" in
+    codex)
+      [ -n "$model" ] || die "provider '$provider' has no model configured"
+      launch_codex "$provider" "$model" "$@"
+      ;;
+    *)
+      launch_generic "$agent" "$provider" "$@"
+      ;;
+  esac
+}
+
+# --- views --------------------------------------------------------------------
+
+cmd_status() {
+  local a bin ver
+  printf '\nAgents\n'
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    bin="$(agent_bin "$a")"
+    if [ -n "$bin" ]; then
+      ver="$(agent_version "$bin")"
+      printf '  \xe2\x9c\x93 %-14s %-20s %s\n' "$a" "${ver:-version unknown}" "$bin"
+    else
+      printf '  \xe2\x9c\x97 %-14s %s\n' "$a" "not installed"
+    fi
+  done < <(all_agent_names)
+
+  printf '\nProviders\n'
+  local p
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    printf '  %-10s %-26s %-9s %-8s %-18s key: %s\n' \
+      "$p" \
+      "$(provider_field "$p" 'label')" \
+      "$(provider_field "$p" 'status')" \
+      "$(provider_field "$p" 'default_agent')" \
+      "$(provider_model "$p")" \
+      "$(key_state "$p")"
+  done < <(cfg '.providers // {} | keys[]')
+
+  printf '\nCommands\n'
+  local line name agent provider args wrapper state
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    name="${line%%$'\t'*}"; line="${line#*$'\t'}"
+    agent="${line%%$'\t'*}"; line="${line#*$'\t'}"
+    provider="${line%%$'\t'*}"; args="${line#*$'\t'}"
+    wrapper="$BIN_DIR/$name"
+    if [ -x "$wrapper" ]; then state="$wrapper"; else state="not generated ($wrapper)"; fi
+    printf '  %-12s %-8s -p %-10s %s\n' "$name" "$agent" "$provider" "$state"
+  done < <(cfg '.commands // {} | to_entries[] | "\(.key)\t\(.value.agent)\t\(.value.provider)\t\(.value.args // "")"')
+
+  printf '\nRun `mux <agent> -p <provider>` to launch, `mux gen <name>` to keep a command.\n'
+}
+
+cmd_agents() {
+  local a bin ver
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    bin="$(agent_bin "$a")"
+    if [ -n "$bin" ]; then
+      ver="$(agent_version "$bin")"
+      printf '%-14s %-20s %s\n' "$a" "${ver:-version unknown}" "$bin"
+    else
+      printf '%-14s %s\n' "$a" "not installed"
+    fi
+  done < <(all_agent_names)
+}
+
+cmd_providers() {
+  local p
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    printf '%-10s %-26s %-9s %-8s %-18s key: %s\n' \
+      "$p" "$(provider_field "$p" 'label')" "$(provider_field "$p" 'status')" \
+      "$(provider_field "$p" 'default_agent')" "$(provider_model "$p")" "$(key_state "$p")"
+  done < <(cfg '.providers // {} | keys[]')
+}
+
+cmd_commands() {
+  local line name agent provider args wrapper
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    name="${line%%$'\t'*}"; line="${line#*$'\t'}"
+    agent="${line%%$'\t'*}"; line="${line#*$'\t'}"
+    provider="${line%%$'\t'*}"; args="${line#*$'\t'}"
+    wrapper="$BIN_DIR/$name"
+    printf '%-12s %-8s -p %-10s %s\n' "$name" "$agent" "$provider" \
+      "$([ -x "$wrapper" ] && printf '%s' "$wrapper" || printf 'not generated')"
+  done < <(cfg '.commands // {} | to_entries[] | "\(.key)\t\(.value.agent)\t\(.value.provider)\t\(.value.args // "")"')
+}
+
+# --- generating and removing commands ----------------------------------------
+
+cmd_gen() {
+  local name="${1:-}"; shift || true
+  local agent="" provider="" args=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --agent|-a)    agent="${2:-}"; shift 2 ;;
+      --provider|-p) provider="${2:-}"; shift 2 ;;
+      --args)        args="${2:-}"; shift 2 ;;
+      *) die "gen: unknown option '$1' (usage: mux gen <name> [--agent A] [--provider P] [--args \"...\"])" ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: mux gen <name> [--agent A] [--provider P]"
+  case "$name" in
+    */*|.*) die "invalid command name: $name" ;;
+  esac
+  # `mux gen stepfun` means: provider stepfun, on its default agent.
+  [ -n "$provider" ] || provider="$LAUNCH_PROVIDER"   # `mux gen z -p glm`
+  [ -n "$provider" ] || provider="$name"
+  provider_exists "$provider" || die "unknown provider '$provider' (see: mux providers)"
+  [ -n "$agent" ] || agent="$LAUNCH_MODEL_AGENT"
+  [ -n "$agent" ] || agent="$(provider_field "$provider" 'default_agent')"
+  [ -n "$agent" ] || agent="codex"
+  [ -n "$(agent_bin "$agent")" ] || note "warning: agent '$agent' is not installed yet"
+
+  {
+    printf '#!/bin/sh\n'
+    printf '# Generated by mux: run %s on provider %s.\n' "$agent" "$provider"
+    if [ -n "$args" ]; then
+      printf 'exec "%s" --launch %s --provider %s %s "$@"\n' "$SELF_PATH" "$agent" "$provider" "$args"
+    else
+      printf 'exec "%s" --launch %s --provider %s "$@"\n' "$SELF_PATH" "$agent" "$provider"
+    fi
+  } | atomic_write "$BIN_DIR/$name" 755
+
+  local entry
+  entry="$(jq -cn --arg a "$agent" --arg p "$provider" --arg x "$args" \
+    '{agent: $a, provider: $p} + (if $x == "" then {} else {args: $x} end)')"
+  jq --arg n "$name" --argjson e "$entry" '.commands[$n] = $e' "$CONFIG_FILE" | atomic_write "$CONFIG_FILE" 600
+
+  printf 'created %s\n' "$BIN_DIR/$name"
+  printf '  %s%s\n' "$name" "${args:+ $args}"
+  case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *) printf '\nnote: %s is not on PATH. Add to your shell profile:\n  export PATH="%s:$PATH"\n' "$BIN_DIR" "$BIN_DIR" ;;
+  esac
+}
+
+cmd_rm() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: mux rm <command>"
+  [ -n "$(cfg --arg n "$name" '.commands[$n] // empty')" ] || die "no such command: $name"
+  local wrapper="$BIN_DIR/$name"
+  if [ -f "$wrapper" ]; then
+    rm -f "$wrapper" || die "could not remove $wrapper"
+    printf 'removed %s\n' "$wrapper"
+  fi
+  jq --arg n "$name" 'del(.commands[$n])' "$CONFIG_FILE" | atomic_write "$CONFIG_FILE" 600
+  printf 'removed command %s from %s\n' "$name" "$CONFIG_FILE"
+}
+
+# --- diagnostics --------------------------------------------------------------
+
+cmd_doctor() {
+  local fails=0
+  ok()   { printf '  \xe2\x9c\x93 %s\n' "$1"; }
+  warn() { printf '  ! %s\n' "$1"; }
+  bad()  { printf '  \xe2\x9c\x97 %s\n' "$1"; fails=$((fails + 1)); }
+
+  command -v jq >/dev/null 2>&1 && ok "jq $(jq --version)" || bad "jq is not installed"
+
+  if jq -e . "$CONFIG_FILE" >/dev/null 2>&1; then ok "config parses: $CONFIG_FILE"; else bad "config is not valid JSON: $CONFIG_FILE"; fi
+  if jq -e . "$SECRETS_FILE" >/dev/null 2>&1; then ok "secrets parse: $SECRETS_FILE"; else bad "secrets are not valid JSON: $SECRETS_FILE"; fi
+  local mode; mode="$(stat -f '%A' "$SECRETS_FILE" 2>/dev/null || stat -c '%a' "$SECRETS_FILE" 2>/dev/null || echo '?')"
+  [ "$mode" = "600" ] && ok "secrets mode 600" || warn "secrets mode is $mode, expected 600"
+
+  local p
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    case "$(key_state "$p")" in
+      missing) warn "provider '$p' has no API key yet (first run will ask)" ;;
+      *)       ok "provider '$p' key: $(key_state "$p")" ;;
+    esac
+  done < <(cfg '.providers // {} | keys[]')
+
+  if [ -n "$(cfg '.providers // {} | to_entries[] | select(.value.default_agent == "codex" or .value.codex) | .key' | head -n1)" ]; then
+    if command -v codex >/dev/null 2>&1; then
+      case "$(codex --help 2>&1 || true)" in
+        *--profile*) ok "codex $(codex --version 2>/dev/null | grep -v -i -E 'warning|error' | head -n1 | awk '{print $2}') supports --profile" ;;
+        *) bad "codex on PATH has no --profile (needs 0.155.1+)" ;;
+      esac
+    else
+      bad "codex is not on PATH but a provider targets it"
+    fi
+    if [ -w "$CODEX_DIR" ] || [ -w "$(dirname "$CODEX_DIR")" ]; then ok "config dir writable: $CODEX_DIR"; else warn "$CODEX_DIR is not writable"; fi
+  fi
+
+  local line name wrapper
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    name="${line%%$'\t'*}"
+    wrapper="$BIN_DIR/$name"
+    if [ -x "$wrapper" ]; then ok "command '$name' -> $wrapper"; else bad "command '$name' has no wrapper at $wrapper"; fi
+  done < <(cfg '.commands // {} | keys[]')
+
+  case ":$PATH:" in
+    *":$BIN_DIR:"*) ok "$BIN_DIR is on PATH" ;;
+    *) warn "$BIN_DIR is not on PATH" ;;
+  esac
+
+  if [ "$fails" -eq 0 ]; then printf '\nall checks passed\n'; return 0; fi
+  printf '\n%s check(s) failed\n' "$fails"
+  return 1
+}
+
+cmd_init() {
+  local force=0
+  [ "${1:-}" = "--force" ] && force=1
+  if [ -f "$CONFIG_FILE" ] && [ "$force" -eq 0 ]; then
+    die "$CONFIG_FILE already exists (use: mux init --force)"
+  fi
+  default_config | atomic_write "$CONFIG_FILE" 600
+  [ -f "$SECRETS_FILE" ] || printf '{}\n' | atomic_write "$SECRETS_FILE" 600
+  chmod 600 "$SECRETS_FILE" 2>/dev/null || true
+  printf 'wrote %s\n' "$CONFIG_FILE"
+}
+
+usage() {
+  cat <<EOF
+mux $VERSION - one launcher for AI coding CLIs and their providers
+
+Usage:
+  mux                              Show installed agents, providers and commands
+  mux <agent> -p <provider> [ARGS] Launch an agent against a provider
+                                    e.g. mux codex -p stepfun
+                                         mux claude -p glm
+  mux gen <name> [--agent A] [--provider P] [--args "..."]
+                                    Write $BIN_DIR/<name> for that combination
+  mux rm <name>                    Remove a generated command
+  mux agents                       List detected agents
+  mux providers                    List providers and key status
+  mux commands                     List generated commands
+  mux doctor                       Check the installation
+  mux init [--force]               (Re)write the default config
+
+Options (consumed by mux; use -- to pass everything through):
+  -p, --provider <name>            Provider to use
+  -m, --model <name>               Override the provider's model
+  --                               Everything after goes to the agent CLI
+
+Config: $CONFIG_FILE
+Keys:   $SECRETS_FILE (mode 600, never printed)
+EOF
+}
+
+# --- dispatch -----------------------------------------------------------------
+
+main() {
+  local launch_agent="" provider="" model=""
+  local -a rest=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --launch)        launch_agent="${2:-}"; shift 2 ;;
+      --provider|-p)   provider="${2:-}"; shift 2 ;;
+      --provider=*)    provider="${1#*=}"; shift ;;
+      --model|-m)      model="${2:-}"; shift 2 ;;
+      --model=*)       model="${1#*=}"; shift ;;
+      --dry-run|-n)    DRY_RUN=1; shift ;;
+      --)              shift; while [ $# -gt 0 ]; do rest+=("$1"); shift; done; break ;;
+      *)               rest+=("$1"); shift ;;
+    esac
+  done
+
+  require_jq
+  ensure_config
+
+  if [ -n "$launch_agent" ]; then
+    launch "$launch_agent" "$provider" "$model" ${rest[@]+"${rest[@]}"}
+    exit 0
+  fi
+  LAUNCH_PROVIDER="$provider"
+
+  local sub="${rest[0]:-}"
+  local -a args=(${rest[@]+"${rest[@]:1}"})
+
+  case "$sub" in
+    ""|status)       cmd_status ;;
+    agents)          cmd_agents ;;
+    providers)       cmd_providers ;;
+    commands)        cmd_commands ;;
+    gen)             cmd_gen ${args[@]+"${args[@]}"} ;;
+    rm|uninstall)    cmd_rm ${args[@]+"${args[@]}"} ;;
+    doctor)          cmd_doctor ;;
+    init)            cmd_init ${args[@]+"${args[@]}"} ;;
+    help|-h|--help)  usage ;;
+    version|-V|--version) printf 'mux %s\n' "$VERSION" ;;
+    *)
+      if [ -n "$(agent_bin "$sub")" ]; then
+        launch "$sub" "$provider" "$model" ${args[@]+"${args[@]}"}
+        return 0
+      fi
+      die "unknown command or agent: '$sub' (see: mux --help)"
+      ;;
+  esac
+}
+
+main "$@"

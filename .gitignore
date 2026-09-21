@@ -1,0 +1,3 @@
+# Local state: config and API keys live in ~/.config/mux, never in the repo.
+*.log
+.DS_Store
