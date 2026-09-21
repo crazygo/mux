@@ -185,9 +185,7 @@ default_config() {
       }
     }
   },
-  "commands": {
-    "stepfun": {"agent": "codex", "provider": "stepfun"}
-  }
+  "commands": {}
 }
 JSON
 }
